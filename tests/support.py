@@ -141,8 +141,8 @@ class ApiCase(unittest.TestCase):
             + observations("a-two", wh=assisted_wh)
         )
 
-    def freeze(self, cut):
-        return self.call("POST", ROOT + "/evidence", {"expected_cut": cut})
+    def freeze(self, cut, *, status=200):
+        return self.call("POST", ROOT + "/evidence", {"expected_cut": cut}, status=status)
 
     def review(self, evidence_id, desk, reviewer, *, assessment="endorse", status=200):
         return self.call("POST", ROOT + f"/evidence/{evidence_id}/markets/alpine/reviews", {

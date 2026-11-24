@@ -10,21 +10,32 @@ from fieldproof.signals.contracts import Delivery, Event
 
 
 def current_cut(db: Connection, trial_id: str) -> int:
-    row = db.execute(
-        "SELECT MAX(delivery_seq) FROM signal WHERE trial_id=?", (trial_id,)
-    ).fetchone()
-    return row[0] or 0
+    """The newest delivery that actually contributed a fact.
+
+    A batch containing only repeated facts still records a delivery row, but it
+    must not move the fact cut: old cuts have to keep reproducing exactly what
+    they reproduced before the retry.
+    """
+    latest = 0
+    for table in ("signal", "curtailment_notice", "curtailment_ack"):
+        row = db.execute(
+            f"SELECT MAX(delivery_seq) FROM {table} WHERE trial_id=?", (trial_id,)
+        ).fetchone()
+        latest = max(latest, row[0] or 0)
+    return latest
 
 
 def require_cut(db: Connection, trial_id: str, cut: int):
     if cut == 0:
         return
-    row = db.execute(
-        "SELECT 1 FROM signal WHERE trial_id=? AND delivery_seq=? LIMIT 1",
-        (trial_id, cut),
-    ).fetchone()
-    if row is None:
-        raise missing("cut", str(cut))
+    for table in ("signal", "curtailment_notice", "curtailment_ack"):
+        row = db.execute(
+            f"SELECT 1 FROM {table} WHERE trial_id=? AND delivery_seq=? LIMIT 1",
+            (trial_id, cut),
+        ).fetchone()
+        if row is not None:
+            return
+    raise missing("cut", str(cut))
 
 
 def receipt(db: Connection, trial_id: str, row, replayed: bool) -> dict:

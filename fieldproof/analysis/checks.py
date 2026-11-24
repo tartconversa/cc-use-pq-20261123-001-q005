@@ -118,6 +118,70 @@ def local_dates(start: date, stop: date):
         yield start + timedelta(days=offset)
 
 
+def safety_register(material: Material, market: str, offset: int, limit: int) -> dict:
+    """Every real alarm and device failure, independent of comparability.
+
+    Reviewers asked for a query that never hides behind primary-comparison
+    eligibility. The register therefore walks all observed cycles in the market
+    window and reports alarms, device-first anomalies and failures, even when
+    the cycle also sits under a curtailed period.
+    """
+    units = {
+        unit_id: item for unit_id, item in material.units.items() if item.market == market
+    }
+    events = []
+    for cycle in material.cycles:
+        item = units.get(cycle.unit_id)
+        if item is None or (cycle.day is not None and not material.window.contains(cycle.day)):
+            continue
+        if not (cycle.alarm or cycle.attribution in {
+            "equipment_failure", "equipment_anomaly_first"
+        }):
+            continue
+        events.append({
+            "unit_id": cycle.unit_id,
+            "cycle_id": cycle.cycle_id,
+            "site": item.site_id,
+            "cell": item.cell,
+            "arm": item.arm,
+            "local_date": cycle.day.isoformat() if cycle.day else None,
+            "state": cycle.state,
+            "attribution": cycle.attribution,
+            "exposure": cycle.exposure,
+            "alarm": cycle.alarm,
+            "alarm_at": cycle.alarm_at.isoformat() if cycle.alarm_at else None,
+            "alarm_reason": cycle.alarm_events[0].reason if cycle.alarm_events else None,
+            "alarm_events": [
+                {
+                    "event_id": event.event_id,
+                    "occurred_at": event.occurred_at.isoformat(),
+                    "reason": event.reason,
+                    "revision": event.revision,
+                }
+                for event in cycle.alarm_events
+            ],
+            "comparable": cycle.comparable,
+            "primary": cycle.primary,
+            "resolved": cycle.usable,
+            "source_revisions": cycle.sources,
+        })
+    events.sort(key=lambda entry: (entry["local_date"] or "", entry["unit_id"],
+                                   entry["cycle_id"]))
+    priorities = {"equipment_anomaly_first": 0, "equipment_failure": 1}
+    events.sort(key=lambda entry: (
+        priorities.get(entry["attribution"], 2),
+        entry["local_date"] or "", entry["unit_id"], entry["cycle_id"],
+    ))
+    return {
+        "market_id": market,
+        "cut": material.cut,
+        "window": material.window.payload(),
+        "total": len(events),
+        "items": events[offset:offset + limit],
+        "next_offset": offset + limit if offset + limit < len(events) else None,
+    }
+
+
 def readiness_calendar(db: Connection, trial: Trial, material: Material, market_id: str) -> dict:
     market = trial.plan.market(market_id)
     if market is None:
@@ -135,7 +199,10 @@ def readiness_calendar(db: Connection, trial: Trial, material: Material, market_
     }
     cycles_by_date: dict[date, list[Cycle]] = defaultdict(list)
     for cycle in material.cycles:
-        if cycle.unit_id in units and cycle.usable and material.window.contains(cycle.day):
+        # The calendar tracks progress toward the primary comparison, so it
+        # counts the same runs the comparison would accept, not every usable
+        # run including curtailed or unconfirmed exposure.
+        if cycle.unit_id in units and cycle.primary and material.window.contains(cycle.day):
             cycles_by_date[cycle.day].append(cycle)
     enrollment_edges = defaultdict(Counter)
     for unit_id, item in units.items():

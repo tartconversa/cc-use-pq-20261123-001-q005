@@ -8,7 +8,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse, Response
 
-from fieldproof.analysis import evidence, influence, reconcile, sensitivity
+from fieldproof.analysis import checks, evidence, influence, omission, reconcile, sensitivity
 from fieldproof.analysis.checks import inspection_queue, readiness_calendar
 from fieldproof.analysis.contrast import estimate
 from fieldproof.common import Problem, conflict, missing
@@ -25,8 +25,8 @@ from fieldproof.design.contracts import (
 )
 from fieldproof.release import bulletins
 from fieldproof.release.contracts import Cut, EvidenceId, FreezeEvidence, IssueBulletin, Review
-from fieldproof.signals import ledger
-from fieldproof.signals.contracts import Delivery
+from fieldproof.signals import curtailment, ledger
+from fieldproof.signals.contracts import AckBatch, Delivery, NoticeBatch
 from fieldproof.storage import Store
 
 QueryCut = Annotated[int, Query(ge=0, le=2**63 - 1)]
@@ -148,6 +148,63 @@ def create_app(database: str | Path) -> FastAPI:
             registry.get_trial(db, trial_id)
             return {"revisions": ledger.history(db, trial_id, event_id)}
 
+    @app.post("/trials/{trial_id}/curtailment/notices")
+    def submit_notices(trial_id: Key, body: NoticeBatch):
+        with store.transaction(write=True) as db:
+            trial = registry.get_trial(db, trial_id)
+            assigned = registry.roster(db, trial_id)
+            return curtailment.record_notices(
+                db, trial, assigned, body.delivery_id, body.notices
+            )
+
+    @app.get("/trials/{trial_id}/curtailment/notices/{notice_id}")
+    def notice_history(trial_id: Key, notice_id: Key):
+        with store.transaction() as db:
+            registry.get_trial(db, trial_id)
+            return {"revisions": curtailment.notice_history(db, trial_id, notice_id)}
+
+    @app.post("/trials/{trial_id}/curtailment/acks")
+    def submit_acks(trial_id: Key, body: AckBatch):
+        with store.transaction(write=True) as db:
+            trial = registry.get_trial(db, trial_id)
+            assigned = registry.roster(db, trial_id)
+            return curtailment.record_acks(
+                db, trial, assigned, body.delivery_id, body.acknowledgments
+            )
+
+    @app.get("/trials/{trial_id}/curtailment/acks/{ack_id}")
+    def ack_history(trial_id: Key, ack_id: Key):
+        with store.transaction() as db:
+            registry.get_trial(db, trial_id)
+            return {"revisions": curtailment.ack_history(db, trial_id, ack_id)}
+
+    @app.get("/trials/{trial_id}/curtailment/exposure")
+    def exposure_readout(trial_id: Key, pick: Selected, site: Key | None = None):
+        with store.transaction() as db:
+            trial = registry.get_trial(db, trial_id)
+            material = evidence.load(db, trial, pick.window(trial), pick.cut)
+            return curtailment.exposure_report(
+                db, trial, material, site
+            )
+
+    @app.get("/trials/{trial_id}/curtailment/notices")
+    def notice_ledger_readout(
+        trial_id: Key, pick: Selected, site: Key | None = None
+    ):
+        with store.transaction() as db:
+            trial = registry.get_trial(db, trial_id)
+            cut = ledger.current_cut(db, trial_id) if pick.cut is None else pick.cut
+            ledger.require_cut(db, trial_id, cut)
+            return curtailment.notice_ledger(db, trial_id, cut, site)
+
+    @app.get("/trials/{trial_id}/curtailment/overlaps")
+    def overlap_readout(trial_id: Key, pick: Selected, site: Key | None = None):
+        with store.transaction() as db:
+            registry.get_trial(db, trial_id)
+            cut = ledger.current_cut(db, trial_id) if pick.cut is None else pick.cut
+            ledger.require_cut(db, trial_id, cut)
+            return curtailment.overlap_diagnostics(db, trial_id, cut, site)
+
     @app.get("/trials/{trial_id}/preview")
     def preview(trial_id: Key, pick: Selected):
         with store.transaction() as db:
@@ -218,6 +275,28 @@ def create_app(database: str | Path) -> FastAPI:
             trial = registry.get_trial(db, trial_id)
             material = evidence.load(db, trial, pick.window(trial), pick.cut)
             return influence.site_readout(trial, material, market)
+
+    @app.get("/trials/{trial_id}/markets/{market}/external-stop-influence")
+    def external_stop_influence(trial_id: Key, market: Key, pick: Selected):
+        with store.transaction() as db:
+            trial = registry.get_trial(db, trial_id)
+            material = evidence.load(db, trial, pick.window(trial), pick.cut)
+            return omission.external_stop_readout(trial, material, market)
+
+    @app.get("/trials/{trial_id}/markets/{market}/safety")
+    def safety_events(
+        trial_id: Key,
+        market: Key,
+        pick: Selected,
+        limit: Limit = 50,
+        offset: Offset = 0,
+    ):
+        with store.transaction() as db:
+            trial = registry.get_trial(db, trial_id)
+            if trial.plan.market(market) is None:
+                raise missing("market", market)
+            material = evidence.load(db, trial, pick.window(trial), pick.cut)
+            return checks.safety_register(material, market, offset, limit)
 
     @app.post("/trials/{trial_id}/evidence")
     def freeze(trial_id: Key, body: FreezeEvidence):

@@ -4,11 +4,23 @@ from dataclasses import dataclass
 from datetime import date
 from sqlite3 import Connection
 
-from fieldproof.analysis.cohorts import AnalysisWindow, UnitSummary, summarize
+from fieldproof.analysis.cohorts import (
+    AnalysisWindow,
+    UnitSummary,
+    apply_common_support,
+    summarize,
+)
 from fieldproof.analysis.contrast import estimate
 from fieldproof.common import encoded, fingerprint, invalid, missing
-from fieldproof.design.registry import Trial, require_phase, roster
+from fieldproof.design.registry import Roster, Trial, require_phase, roster
 from fieldproof.release.gates import assess
+from fieldproof.signals.curtailment import (
+    UnitExposure,
+    acks_at,
+    build_exposure,
+    classify,
+    notices_at,
+)
 from fieldproof.signals.cycles import Cycle, resolve_cycles
 from fieldproof.signals.ledger import current_cut, events_at, require_cut
 
@@ -21,6 +33,8 @@ class Material:
     cut: int
     cycles: list[Cycle]
     units: dict[str, UnitSummary]
+    exposure: dict[str, UnitExposure]
+    roster: Roster
 
 
 def select_window(trial: Trial, start: date | None, end: date | None) -> AnalysisWindow:
@@ -28,7 +42,15 @@ def select_window(trial: Trial, start: date | None, end: date | None) -> Analysi
     ends = trial.plan.ends_before if end is None else end
     if not trial.plan.starts_on <= starts < ends <= trial.plan.ends_before:
         raise invalid("analysis_window", "Select a non-empty interval inside the trial dates")
-    return AnalysisWindow(starts, ends)
+    segments = tuple(
+        (max(period_start, starts), min(period_stop, ends))
+        for period_start, period_stop in trial.plan.comparison_windows()
+        if max(period_start, starts) < min(period_stop, ends)
+    )
+    # The observed window stays complete so safety counts see every run. The
+    # primary comparison is limited to the pre-registered periods, even when a
+    # caller asks for a wider or narrower readout.
+    return AnalysisWindow(starts, ends, segments if segments else None)
 
 
 def load(
@@ -42,12 +64,25 @@ def load(
     selected = current_cut(db, trial.trial_id) if cut is None else cut
     require_cut(db, trial.trial_id, selected)
     assigned = roster(db, trial.trial_id)
+    exposure = build_exposure(
+        assigned,
+        notices_at(db, trial.trial_id, selected),
+        acks_at(db, trial.trial_id, selected),
+    )
     cycles = resolve_cycles(
         events_at(db, trial.trial_id, selected),
         assigned,
         trial.plan.policy,
     )
-    return Material(window, selected, cycles, summarize(trial, assigned, cycles, window))
+    for cycle in cycles:
+        classify(cycle, exposure.get(cycle.unit_id))
+    apply_common_support(trial, assigned, cycles, window)
+    return Material(
+        window, selected, cycles,
+        summarize(trial, assigned, cycles, window),
+        exposure,
+        assigned,
+    )
 
 
 def analyze(trial: Trial, material: Material) -> dict:
@@ -75,6 +110,9 @@ def analyze(trial: Trial, material: Material) -> dict:
         ]),
         "facts_digest": fingerprint(relevant),
         "unit_digest": fingerprint(units),
+        "curtailment_digest": fingerprint([
+            (row.unit_id, row.notice_ids, row.issues) for row in material.exposure.values()
+        ]),
         "market_results": markets,
     }
 

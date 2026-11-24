@@ -66,7 +66,6 @@ class CellEstimate:
             },
         }
 
-
 def coverage_gaps(arm: str, summary: ArmSummary, policy: Policy) -> list[dict]:
     gaps = []
     usable = len(summary.eligible)
@@ -145,6 +144,45 @@ class MarketEstimate:
             "by_site": integrity_by_site(units),
         }
 
+    def safety(self) -> dict:
+        by_arm = {
+            arm: cell.arms[arm].safety()
+            for cell in self.cells for arm in ARMS
+        }
+        totals = {
+            key: sum(by_arm[arm][key] for arm in by_arm)
+            for key in next(iter(by_arm.values()))
+        } if by_arm else {}
+        return {"by_arm": by_arm, "totals": totals}
+
+    def participation(self) -> dict:
+        """Runs that left the primary comparison, grouped by reason.
+
+        A restricted or uncontrolled period is listed rather than folded into
+        the other arm's opportunity set, so a reader can tell which comparison
+        the numbers actually rest on.
+        """
+        buckets = {"restricted": [], "uncontrolled": []}
+        for cell in self.cells:
+            for arm, summary in cell.arms.items():
+                for unit in summary.recruited:
+                    if unit.restricted_cycles:
+                        buckets["restricted"].append({
+                            "cell": cell.key, "arm": arm, "unit_id": unit.unit_id,
+                            "cycles": unit.restricted_cycles,
+                            "external_stop_cycles": unit.external_stops,
+                            "exposure_unknown_cycles": unit.exposure_unknown,
+                        })
+                    if unit.comparable_cycles > unit.primary_cycles:
+                        buckets["uncontrolled"].append({
+                            "cell": cell.key, "arm": arm, "unit_id": unit.unit_id,
+                            "comparable_cycles": unit.comparable_cycles,
+                            "outside_common_support": (
+                                unit.comparable_cycles - unit.primary_cycles
+                            ),
+                        })
+        return buckets
+
     def payload(self) -> dict:
         return {
             "market_id": self.market.market_id,
@@ -154,6 +192,8 @@ class MarketEstimate:
                 name: pair(name, self.standard[name], self.assisted[name]) for name in METRICS
             },
             "integrity": self.integrity(),
+            "safety": self.safety(),
+            "participation": self.participation(),
         }
 
 
@@ -168,6 +208,16 @@ def integrity_by_site(units: list[UnitSummary]) -> dict[str, dict[str, int]]:
 
 def estimate(trial: Trial, units: dict[str, UnitSummary]) -> list[MarketEstimate]:
     placed = by_placement(units.values())
+    return [
+        MarketEstimate.build(market, assess_cells(market, placed, trial.plan.policy))
+        for market in trial.plan.markets
+    ]
+
+
+def estimate_without(trial: Trial, units: dict[str, UnitSummary], excluded: set[str]):
+    placed = by_placement(
+        unit for unit_id, unit in units.items() if unit_id not in excluded
+    )
     return [
         MarketEstimate.build(market, assess_cells(market, placed, trial.plan.policy))
         for market in trial.plan.markets

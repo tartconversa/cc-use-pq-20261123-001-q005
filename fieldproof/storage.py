@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS delivery (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     trial_id TEXT NOT NULL REFERENCES trial(trial_id),
     delivery_id TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'signals' CHECK (kind IN ('signals','curtailment')),
     digest TEXT NOT NULL,
     accepted INTEGER NOT NULL DEFAULT 0,
     repeated INTEGER NOT NULL DEFAULT 0,
@@ -52,6 +53,32 @@ CREATE TABLE IF NOT EXISTS signal (
 );
 CREATE INDEX IF NOT EXISTS signal_cut ON signal(trial_id, delivery_seq);
 CREATE INDEX IF NOT EXISTS signal_cycle ON signal(trial_id, unit_id, cycle_id);
+CREATE TABLE IF NOT EXISTS curtailment_notice (
+    trial_id TEXT NOT NULL REFERENCES trial(trial_id),
+    notice_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    delivery_seq INTEGER NOT NULL REFERENCES delivery(seq),
+    notice TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    PRIMARY KEY (trial_id, notice_id, revision)
+);
+CREATE INDEX IF NOT EXISTS curtailment_notice_cut
+    ON curtailment_notice(trial_id, delivery_seq);
+CREATE TABLE IF NOT EXISTS curtailment_ack (
+    trial_id TEXT NOT NULL REFERENCES trial(trial_id),
+    ack_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    notice_id TEXT NOT NULL,
+    unit_id TEXT NOT NULL,
+    delivery_seq INTEGER NOT NULL REFERENCES delivery(seq),
+    ack TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    PRIMARY KEY (trial_id, ack_id, revision)
+);
+CREATE INDEX IF NOT EXISTS curtailment_ack_cut
+    ON curtailment_ack(trial_id, delivery_seq);
+CREATE INDEX IF NOT EXISTS curtailment_ack_notice
+    ON curtailment_ack(trial_id, notice_id, unit_id);
 CREATE TABLE IF NOT EXISTS evidence (
     trial_id TEXT NOT NULL REFERENCES trial(trial_id),
     evidence_id TEXT NOT NULL,
@@ -86,6 +113,16 @@ CREATE TABLE IF NOT EXISTS bulletin (
 PRAGMA user_version=1;
 """
 
+# Version 1 databases predate site-level curtailment. The new tables are
+# additive, so opening an older file upgrades it in place without rewriting
+# previously frozen evidence.
+UPGRADES = {
+    1: (
+        "ALTER TABLE delivery ADD COLUMN kind TEXT NOT NULL DEFAULT 'signals' "
+        "CHECK (kind IN ('signals','curtailment'))",
+    ),
+}
+
 
 class Store:
     def __init__(self, location: str | Path):
@@ -97,6 +134,13 @@ class Store:
             if version not in (0, 1):
                 raise RuntimeError(f"Unsupported database version {version}")
             session.execute("PRAGMA journal_mode=WAL")
+            if version == 1:
+                columns = {
+                    row[1] for row in session.execute("PRAGMA table_info(delivery)")
+                }
+                if "kind" not in columns:
+                    for statement in UPGRADES[1]:
+                        session.execute(statement)
             session.executescript(SCHEMA)
         finally:
             session.close()

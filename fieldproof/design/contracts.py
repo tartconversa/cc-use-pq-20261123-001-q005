@@ -66,6 +66,7 @@ class Policy(Input):
     required_units_per_arm: Annotated[StrictInt, Field(ge=2, le=100)]
     required_cycles_per_unit: Annotated[StrictInt, Field(ge=1, le=100)]
     minimum_unit_coverage_bp: Rate
+    minimum_common_coverage_bp: Rate = 0
     max_alarm_increase_bp: Rate
     max_failure_increase_bp: Rate
     min_manual_saving_bp: Rate
@@ -75,6 +76,18 @@ class Policy(Input):
     max_cycle_wh: Annotated[StrictInt, Field(ge=1, le=50_000)]
 
 
+class ComparisonWindow(Input):
+    label: Key
+    starts_on: date
+    ends_before: date
+
+    @model_validator(mode="after")
+    def interval(self):
+        if self.starts_on >= self.ends_before:
+            raise ValueError("A comparison window ends after it starts")
+        return self
+
+
 class TrialPlan(Input):
     title: ShortText
     program: Key
@@ -82,6 +95,7 @@ class TrialPlan(Input):
     ends_before: date
     policy: Policy
     markets: list[Market] = Field(min_length=1, max_length=20)
+    primary_windows: list[ComparisonWindow] = Field(default_factory=list, max_length=24)
 
     @model_validator(mode="after")
     def trial_window(self):
@@ -90,7 +104,26 @@ class TrialPlan(Input):
             raise ValueError("Trial must span between 1 and 180 local dates")
         if len({market.market_id for market in self.markets}) != len(self.markets):
             raise ValueError("Market identifiers must be unique")
+        keys = [(window.label, window.starts_on, window.ends_before)
+                for window in self.primary_windows]
+        if len({label for label, _, _ in keys}) != len(keys):
+            raise ValueError("Comparison window labels must be unique")
+        ordered = sorted(self.primary_windows, key=lambda window: window.starts_on)
+        for window in ordered:
+            if window.starts_on < self.starts_on or window.ends_before > self.ends_before:
+                raise ValueError("Comparison windows must stay inside the trial dates")
+        for previous, current in zip(ordered, ordered[1:]):
+            if current.starts_on < previous.ends_before:
+                raise ValueError("Comparison windows cannot overlap")
         return self
+
+    def comparison_windows(self) -> list[tuple[date, date]]:
+        if not self.primary_windows:
+            return [(self.starts_on, self.ends_before)]
+        return [(window.starts_on, window.ends_before) for window in self.primary_windows]
+
+    def in_primary_window(self, day: date) -> bool:
+        return any(start <= day < stop for start, stop in self.comparison_windows())
 
     def market(self, market_id: str) -> Market | None:
         return next((item for item in self.markets if item.market_id == market_id), None)

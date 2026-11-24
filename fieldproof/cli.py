@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 from datetime import date
+import json
 from pathlib import Path
 import sys
 
@@ -12,7 +13,8 @@ from fieldproof.analysis import evidence, reconcile
 from fieldproof.common import encoded, Problem, invalid
 from fieldproof.design.contracts import Key, Input
 from fieldproof.design.registry import get_trial, roster
-from fieldproof.signals import ledger
+from fieldproof.signals import curtailment, ledger
+from fieldproof.signals.contracts import AckBatch, NoticeBatch
 from fieldproof.signals.sheets import parse_sheet
 from fieldproof.storage import Store
 
@@ -34,6 +36,34 @@ def import_sheet(db, arguments):
     with handle as source:
         delivery = parse_sheet(source, select.delivery_id, assigned)
     return encoded(ledger.append(db, trial, assigned, delivery))
+
+
+def _read_json(arguments):
+    handle = (
+        nullcontext(sys.stdin)
+        if arguments.file == "-"
+        else Path(arguments.file).open("r", encoding="utf-8-sig")
+    )
+    with handle as source:
+        return json.load(source)
+
+
+def import_notices(db, arguments):
+    trial = get_trial(db, arguments.trial)
+    assigned = roster(db, trial.trial_id)
+    payload = NoticeBatch.model_validate({**_read_json(arguments), "delivery_id": arguments.delivery})
+    return encoded(curtailment.record_notices(
+        db, trial, assigned, payload.delivery_id, payload.notices
+    ))
+
+
+def import_acks(db, arguments):
+    trial = get_trial(db, arguments.trial)
+    assigned = roster(db, trial.trial_id)
+    payload = AckBatch.model_validate({**_read_json(arguments), "delivery_id": arguments.delivery})
+    return encoded(curtailment.record_acks(
+        db, trial, assigned, payload.delivery_id, payload.acknowledgments
+    ))
 
 
 def preview(db, arguments):
@@ -65,6 +95,18 @@ def make_parser():
     ingest.add_argument("trial", help="Trial identifier")
     ingest.add_argument("delivery", help="Stable delivery identifier for retries")
     ingest.add_argument("sheet", help="UTF-8 CSV file, or - for standard input")
+    notices = commands.add_parser(
+        "ingest-notices", help="Record site curtailment notices from JSON"
+    )
+    notices.add_argument("trial")
+    notices.add_argument("delivery", help="Stable delivery identifier for retries")
+    notices.add_argument("file", help="UTF-8 JSON file, or - for standard input")
+    acks = commands.add_parser(
+        "ingest-acks", help="Record runtime curtailment acknowledgments from JSON"
+    )
+    acks.add_argument("trial")
+    acks.add_argument("delivery")
+    acks.add_argument("file", help="UTF-8 JSON file, or - for standard input")
     draft = commands.add_parser("preview", help="Inspect an as-of comparison")
     draft.add_argument("trial")
     draft.add_argument("--start", type=iso_date)
@@ -79,15 +121,22 @@ def make_parser():
 
 def main(argv=None):
     args = make_parser().parse_args(argv)
-    actions = {"ingest-sheet": import_sheet, "preview": preview, "export": export}
+    actions = {
+        "ingest-sheet": import_sheet,
+        "ingest-notices": import_notices,
+        "ingest-acks": import_acks,
+        "preview": preview,
+        "export": export,
+    }
+    writes = {"ingest-sheet", "ingest-notices", "ingest-acks"}
     try:
         store = Store(args.db)
-        with store.transaction(write=args.command == "ingest-sheet") as db:
+        with store.transaction(write=args.command in writes) as db:
             output = actions[args.command](db, args)
     except Problem as exc:
         print(encoded(exc.payload()), file=sys.stderr)
         return 1
-    except (OSError, UnicodeError, ValidationError) as exc:
+    except (OSError, UnicodeError, ValidationError, json.JSONDecodeError) as exc:
         print(encoded({"code": "input_error", "message": str(exc)}), file=sys.stderr)
         return 1
     sys.stdout.write(output)

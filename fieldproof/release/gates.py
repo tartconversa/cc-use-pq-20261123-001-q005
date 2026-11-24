@@ -55,6 +55,42 @@ def energy_gate(estimate: MarketEstimate, policy: Policy) -> Gate:
     )
 
 
+def emergency_gate(estimate: MarketEstimate) -> Gate:
+    """A resolved emergency event blocks expansion regardless of the sample.
+
+    A resolved alarm is evidence that the assisted program exposed a real
+    safety event, so it forces a hold even when the comparison looks clean.
+    An alarm on a run that could not be resolved is reported as unavailable:
+    the market cannot advance on incomplete safety evidence, but the system
+    does not pretend it has confirmed a failure it cannot yet analyse. Both
+    remain visible in the inspection queue and the safety counts.
+    """
+    safety = estimate.safety()["totals"]
+    if not safety:
+        return Gate("emergency_events", "unavailable")
+    confirmed = safety.get("alarm_cycles", 0)
+    unresolved = safety.get("unresolved_alarm_cycles", 0)
+    if confirmed:
+        return Gate("emergency_events", "fail", str(confirmed), 0, "at_most")
+    if unresolved:
+        return Gate("emergency_events", "unavailable", str(unresolved), 0, "at_most")
+    return Gate("emergency_events", "pass", "0", 0, "at_most")
+
+
+def sample_gate(estimate: MarketEstimate) -> Gate:
+    """The primary comparison must rest on supported, curated runs."""
+    gaps = [gap for cell in estimate.cells for gap in cell.gaps]
+    if gaps:
+        return Gate("comparable_sample", "unavailable", None, None, None)
+    total = sum(
+        cell.arms[arm].payload()["eligible_primary_cycles"]
+        for cell in estimate.cells for arm in cell.arms
+    )
+    if not total:
+        return Gate("comparable_sample", "unavailable", "0", 1, "at_least")
+    return Gate("comparable_sample", "pass", str(total), 1, "at_least")
+
+
 def assess(estimate: MarketEstimate, policy: Policy) -> dict:
     integrity = estimate.integrity()
     manual = estimate.delta("manual")
@@ -63,6 +99,8 @@ def assess(estimate: MarketEstimate, policy: Policy) -> dict:
     gates = [
         Gate("planned_cell_coverage", "pass" if coverage else "unavailable"),
         threshold("units_with_unresolved_cycles", unresolved, 0, "at_most"),
+        emergency_gate(estimate),
+        sample_gate(estimate),
         threshold("alarm_increase_bp", in_basis_points(estimate.delta("alarm")),
                   policy.max_alarm_increase_bp, "at_most"),
         threshold("failure_increase_bp", in_basis_points(estimate.delta("failure")),
@@ -71,7 +109,9 @@ def assess(estimate: MarketEstimate, policy: Policy) -> dict:
                   policy.min_manual_saving_bp, "at_least"),
         energy_gate(estimate, policy),
     ]
-    if any(gate.state == "fail" and gate.name != "units_with_unresolved_cycles" for gate in gates):
+    blocking = {"emergency_events"}
+    if any(gate.state == "fail" and gate.name != "units_with_unresolved_cycles"
+           for gate in gates):
         recommendation = "hold"
     elif any(gate.state != "pass" for gate in gates):
         recommendation = "insufficient"
@@ -81,4 +121,7 @@ def assess(estimate: MarketEstimate, policy: Policy) -> dict:
         "recommendation": recommendation,
         "gates": [gate.payload() for gate in gates],
         "blocked_by": [gate.name for gate in gates if gate.state != "pass"],
+        "emergency_blocked": any(
+            gate.name in blocking and gate.state == "fail" for gate in gates
+        ),
     }
